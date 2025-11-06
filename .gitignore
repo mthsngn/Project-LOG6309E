@@ -1,0 +1,45 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.so
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Logs and databases ---
+*.log
+
+# --- Unit test / coverage reports ---
+.coverage
+.tox/
+.nox/
+htmlcov/
+.pytest_cache/
+.coverage.*
+
+# --- Jupyter Notebooks checkpoints ---
+.ipynb_checkpoints
+
+# --- IDEs / Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Environment variables ---
+.env
+.env.*
+*.env
+
+# --- Other ---
+tracebench/
