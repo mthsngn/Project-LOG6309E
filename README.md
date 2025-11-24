@@ -16,7 +16,7 @@ PROJECT-LOG6309E/
 ├── datasets/                   # Raw datasets
 │   ├── tracebench/             # TraceBench dataset
 │   ├── BGL/                    # BGL dataset (.log)
-│   └── HDFS/             # HDFS dataset (.log + anomaly.csv)
+│   └── HDFS/                   # HDFS dataset (.log + anomaly.csv)
 │
 ├── fault_classification/       # Fault classification models (baseline, BERT, GNN) for Tracebench
 │
