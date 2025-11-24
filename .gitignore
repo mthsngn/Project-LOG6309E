@@ -42,4 +42,11 @@ Thumbs.db
 *.env
 
 # --- Other ---
-tracebench/
+datasets/
+graph_cache/
+master_tables/
+
+preprocess_BGL/drain_states
+preprocess_BGL/parsed_logs
+
+bert_sequences/*.csv

@@ -4,8 +4,8 @@ from typing import Dict, Optional, List
 from dataclasses import dataclass
 import pandas as pd
 
-DATA_PATH = "tracebench_test"
-CSV_PATH = "master_tables_test"
+DATA_PATH = "../datasets/tracebench_test"
+CSV_PATH = "../master_tables/tracebench/test"
 
 def fixed_read_csv(path):
     """Fix event.csv dynamically by quoting the Description field."""

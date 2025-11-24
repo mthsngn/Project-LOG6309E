@@ -18,6 +18,7 @@ import json
 # =========================
 def _graphs_cache_path(cache_dir, split_name, ids):
     os.makedirs(cache_dir, exist_ok=True)
+    # fingerprint depends on the exact ordered TaskID list
     s = json.dumps(list(map(str, ids)), separators=(",", ":"), ensure_ascii=False)
     fid = hashlib.md5(s.encode("utf-8")).hexdigest()[:16]
     return os.path.join(cache_dir, f"{split_name}_graphs_{fid}.pt")
@@ -27,12 +28,12 @@ def stats(graphs):
     es = [g.edge_index.size(1) for g in graphs]
     return np.mean(ns), np.mean(es)
 
-def show_split_distribution_multiclass(traces_df, name, ids, label_col="FaultType", top_k=5):
+def show_split_distribution(traces_df, name, ids):
     subset = traces_df[traces_df["TaskID"].astype(str).isin(ids)]
-    vc = subset[label_col].astype(str).value_counts()
-    total = int(vc.sum())
-    head = ", ".join([f"{k}:{int(v)}({v/total:.1%})" for k, v in vc.head(top_k).items()])
-    print(f"{name:<5} : total={total:5d} | classes={len(vc)} | top{top_k}: {head}")
+    counts = subset["IsAbnormal"].value_counts().to_dict()
+    total = len(subset)
+    normal = counts.get(0, 0); abnormal = counts.get(1, 0)
+    print(f"{name:<5} : total={total:5d} | normal={normal:5d} ({normal/total:.2%}) | abnormal={abnormal:5d} ({abnormal/total:.2%})")
 
 # =========================
 # Data loading & splitting
@@ -44,9 +45,9 @@ def load_csvs(csv_path):
     ops_df    = pd.read_csv(os.path.join(csv_path, "operations.csv"))
     return traces_df, events_df, edges_df, ops_df
 
-def stratified_ids(traces_df, seed=42, label_col="FaultType"):
+def stratified_ids(traces_df, seed=42):
     trace_ids = traces_df["TaskID"].astype(str)
-    labels    = traces_df[label_col].astype(str)
+    labels    = traces_df["IsAbnormal"].astype(int)
     train_ids, temp_ids, y_train, y_temp = train_test_split(
         trace_ids, labels, test_size=0.30, stratify=labels, random_state=seed
     )
@@ -65,16 +66,7 @@ def build_op_vocab(events_df):
     num_ops = len(opname_to_ix)
     return opname_to_ix, num_ops
 
-def build_fault_vocab(traces_df, label_col="FaultType"):
-    labels = traces_df[label_col].astype(str).fillna("<UNK>").unique()
-    labels = sorted(labels)
-    fault_to_ix = {lab: i for i, lab in enumerate(labels)}
-    ix_to_fault = {i: lab for lab, i in fault_to_ix.items()}
-    num_classes = len(fault_to_ix)
-    return fault_to_ix, ix_to_fault, num_classes
-
-def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_to_ix=None,
-                               label_col="FaultType", fault_to_ix=None):
+def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_to_ix=None):
     ev = events_df[events_df["TaskID"] == task_id].copy()
     ed = edges_df[edges_df["TaskID"] == task_id].copy()
     tr = traces_df[traces_df["TaskID"] == task_id].iloc[0]
@@ -95,20 +87,17 @@ def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_t
         if r["ChildTID"]  in idx: indeg[r["ChildTID"]]  += 1
 
     indeg_d, outdeg_d = indeg.to_dict(), outdeg.to_dict()
-    x_num = np.c_[stn.to_numpy(),
-                  dun.to_numpy(),
-                  ev["TID"].map(indeg_d).fillna(0).to_numpy(),
-                  ev["TID"].map(outdeg_d).fillna(0).to_numpy()].astype("float32")
+
+    x_num = np.c_[
+        stn.to_numpy(),
+        dun.to_numpy(),
+        ev["TID"].map(indeg_d).fillna(0).to_numpy(),
+        ev["TID"].map(outdeg_d).fillna(0).to_numpy(),
+    ].astype("float32")
 
     op_ix = None
     if opname_to_ix is not None and "OpName" in ev.columns:
         op_ix = ev["OpName"].map(lambda s: opname_to_ix.get(str(s), 0)).to_numpy().astype("int64")
-
-    if fault_to_ix is None:
-        raise ValueError("fault_to_ix mapping required for FaultType classification.")
-    y_id = fault_to_ix.get(str(tr[label_col]), None)
-    if y_id is None:
-        y_id = fault_to_ix.get("<UNK>", 0)
 
     src, dst = [], []
     for _, r in ed.iterrows():
@@ -119,13 +108,12 @@ def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_t
     data = {
         "x_num": x_num,
         "edge_index": np.array([src, dst], dtype="int64"),
-        "y": np.array([int(y_id)], dtype="int64"),
+        "y": np.array([int(tr["IsAbnormal"])], dtype="int64"),
         "TraceId": task_id,
     }
     if op_ix is not None:
         data["op_idx"] = op_ix
     return data
-
 
 def to_pyg_data(g):
     x_num = torch.from_numpy(g["x_num"])
@@ -139,39 +127,37 @@ def to_pyg_data(g):
     return data
 
 def build_graphs(ids, split_name, events_df, edges_df, traces_df, opname_to_ix,
-                 fault_to_ix, label_col="FaultType", progress_every=50,
-                 cache_dir="graph_cache"):
-    # ----- try cache -----
+                 progress_every=50, cache_dir="../graph_cache"):
+    # ---- try cache first ----
     cache_path = _graphs_cache_path(cache_dir, split_name, ids)
     if os.path.exists(cache_path):
         print(f"\nLoading cached {split_name} graphs from {cache_path} ...")
         return torch.load(cache_path)
 
-    # ----- build from scratch -----
+    # ---- build from scratch ----
     print(f"\nBuilding {split_name} graphs ({len(ids)} traces)...")
     graphs, skipped = [], 0
     for i, tid in enumerate(ids, 1):
         try:
-            g = build_graph_data_for_trace(
-                events_df, edges_df, traces_df, tid,
-                opname_to_ix=opname_to_ix,
-                label_col=label_col,
-                fault_to_ix=fault_to_ix
-            )
-            graphs.append(to_pyg_data(g))
+            g = build_graph_data_for_trace(events_df, edges_df, traces_df, tid, opname_to_ix)
+            g = to_pyg_data(g)
+            if g is not None:
+                graphs.append(g)
+            else:
+                skipped += 1
         except Exception as e:
             skipped += 1
             print(f"Skipping {tid}: {e}")
+
         if i % progress_every == 0 or i == len(ids):
             print(f"Processed {i}/{len(ids)} | valid: {len(graphs)} | skipped: {skipped}")
 
     print(f"Done {split_name}: {len(graphs)} valid, {skipped} skipped")
 
-    # ----- save cache -----
+    # ---- save cache ----
     torch.save(graphs, cache_path)
     print(f"Saved {split_name} graphs to {cache_path}\n")
     return graphs
-
 
 # =========================
 # Model & training
@@ -218,7 +204,7 @@ def run_epoch(model, loader, device, opt, criterion, training=True):
             total += batch.num_graphs
     return loss_sum / total, correct / total
 
-def prf_metrics(model, loader, device, average="macro"):
+def prf_metrics(model, loader, device):
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -230,7 +216,7 @@ def prf_metrics(model, loader, device, average="macro"):
             all_labels.append(batch.y.cpu().numpy())
     y_pred = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
-    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average=average, zero_division=0)
+    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
     acc = accuracy_score(y_true, y_pred)
     return acc, p, r, f1
 
@@ -240,9 +226,9 @@ def make_loaders(train_graphs, val_graphs, test_graphs, batch_size=16):
     test_loader  = DataLoader(test_graphs,  batch_size=batch_size)
     return train_loader, val_loader, test_loader
 
-def init_model(train_graphs, num_ops, device, num_classes, lr=1e-3, wd=1e-4, class_weights=None):
+def init_model(train_graphs, num_ops, device, lr=1e-3, wd=1e-4, class_weights=None):
     x_num_dim = train_graphs[0].x.size(1)
-    model = GraphClassifier(num_ops=num_ops, x_num_dim=x_num_dim, num_classes=num_classes).to(device)
+    model = GraphClassifier(num_ops=num_ops, x_num_dim=x_num_dim).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     return model, opt, criterion
@@ -251,12 +237,12 @@ def train_and_eval(model, opt, criterion, train_loader, val_loader, device, epoc
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc = run_epoch(model, train_loader, device, opt, criterion, training=True)
         va_loss, va_acc = run_epoch(model, val_loader,   device, opt, criterion, training=False)
-        va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device, average="macro")
+        va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device)
         print(
             f"Epoch {epoch:02d} | "
             f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
             f"val loss {va_loss:.4f} acc {va_acc:.3f} | "
-            f"VAL (macro) pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
+            f"VAL pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
         )
 
 def test_model(model, test_loader, device):
@@ -268,62 +254,40 @@ def test_model(model, test_loader, device):
 # =========================
 
 if __name__ == "__main__":
-    CSV_PATH = "master_tables_test"
-    SEED = 42; 
-    BATCH_SIZE = 16; 
-    EPOCHS = 50
-    LABEL_COL = "FaultType"
-
+    CSV_PATH = "../master_tables/HDFS/test"
+    SEED = 42
+    BATCH_SIZE = 16
+    EPOCHS = 20
+    
     traces_df, events_df, edges_df, ops_df = load_csvs(CSV_PATH)
-    traces_df = traces_df[traces_df["IsAbnormal"] == 1].reset_index(drop=True)
 
-    # Stratify by FaultType
-    train_ids, val_ids, test_ids = stratified_ids(traces_df, seed=SEED, label_col=LABEL_COL)
+    train_ids, val_ids, test_ids = stratified_ids(traces_df, seed=SEED)
 
     print(f"Total traces: {len(traces_df['TaskID'].unique())}")
     print(f"Train: {len(train_ids)} | Val: {len(val_ids)} | Test: {len(test_ids)}")
-    print("\nClass distribution (top classes):")
-    show_split_distribution_multiclass(traces_df, "Train", train_ids, label_col=LABEL_COL)
-    show_split_distribution_multiclass(traces_df, "Val",   val_ids,   label_col=LABEL_COL)
-    show_split_distribution_multiclass(traces_df, "Test",  test_ids,  label_col=LABEL_COL)
+    print("\nClass distribution:")
+    show_split_distribution(traces_df, "Train", train_ids)
+    show_split_distribution(traces_df, "Val",   val_ids)
+    show_split_distribution(traces_df, "Test",  test_ids)
 
-    # Vocabularies
     opname_to_ix, num_ops = build_op_vocab(events_df)
-    fault_to_ix, ix_to_fault, num_classes = build_fault_vocab(traces_df, label_col=LABEL_COL)
 
-    # Graphs
-    train_graphs = build_graphs(train_ids, "train", events_df, edges_df, traces_df,
-                                opname_to_ix, fault_to_ix, label_col=LABEL_COL)
-    val_graphs   = build_graphs(val_ids, "val", events_df, edges_df, traces_df,
-                                opname_to_ix, fault_to_ix, label_col=LABEL_COL)
-    test_graphs  = build_graphs(test_ids, "test", events_df, edges_df, traces_df,
-                                opname_to_ix, fault_to_ix, label_col=LABEL_COL)
+    train_graphs = build_graphs(train_ids, "train", events_df, edges_df, traces_df, opname_to_ix)
+    val_graphs   = build_graphs(val_ids,   "val",   events_df, edges_df, traces_df, opname_to_ix)
+    test_graphs  = build_graphs(test_ids,  "test",  events_df, edges_df, traces_df, opname_to_ix)
 
     train_loader, val_loader, test_loader = make_loaders(train_graphs, val_graphs, test_graphs, BATCH_SIZE)
+    print("Graphs  | train:", len(train_graphs), "val:", len(val_graphs), "test:", len(test_graphs))
+    print("Batches | train:", len(train_loader), "val:", len(val_loader), "test:", len(test_loader))
+    mN, mE = stats(train_graphs)
+    print(f"Avg nodes/graph: {mN:.1f} | Avg edges/graph: {mE:.1f}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     y_train = np.array([g.y.item() for g in train_graphs])
     classes = np.unique(y_train)
-    weights = compute_class_weight(
-        class_weight="balanced", classes=classes, y=y_train
-    )
+    weights = compute_class_weight("balanced", classes=classes, y=y_train)
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
-    model, opt, criterion = init_model(
-    train_graphs, num_ops, device, num_classes, class_weights=class_weights
-    )
+    model, opt, criterion = init_model(train_graphs, num_ops, device, class_weights=class_weights)
 
-    # Train / Eval
-    for epoch in range(1, EPOCHS + 1):
-        tr_loss, tr_acc = run_epoch(model, train_loader, device, opt, criterion, training=True)
-        va_loss, va_acc = run_epoch(model, val_loader,   device, opt, criterion, training=False)
-        va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device, average="macro")
-        print(
-            f"Epoch {epoch:02d} | "
-            f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
-            f"val loss {va_loss:.4f} acc {va_acc:.3f} | "
-            f"VAL (macro) pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
-        )
-
-    te_acc, te_p, te_r, te_f1 = prf_metrics(model, test_loader, device, average="macro")
-    print(f"\nTEST (macro) acc {te_acc:.3f} | pr {te_p:.3f} rc {te_r:.3f} f1 {te_f1:.3f}")
-
+    train_and_eval(model, opt, criterion, train_loader, val_loader, device, EPOCHS)
+    test_model(model, test_loader, device)
