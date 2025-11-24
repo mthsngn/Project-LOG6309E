@@ -48,5 +48,7 @@ master_tables/
 
 preprocess_BGL/drain_states
 preprocess_BGL/parsed_logs
+preprocess_HDFS/drain_states
+preprocess_HDFS/parsed_logs
 
 bert_sequences/*.csv

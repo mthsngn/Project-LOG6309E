@@ -29,7 +29,7 @@ def stats(graphs):
     return np.mean(ns), np.mean(es)
 
 def show_split_distribution(traces_df, name, ids):
-    subset = traces_df[traces_df["TaskID"].isin(ids)]
+    subset = traces_df[traces_df["TaskID"].astype(str).isin(ids)]
     counts = subset["IsAbnormal"].value_counts().to_dict()
     total = len(subset)
     normal = counts.get(0, 0); abnormal = counts.get(1, 0)
@@ -42,10 +42,11 @@ def load_csvs(csv_path):
     traces_df = pd.read_csv(os.path.join(csv_path, "traces.csv"))
     events_df = pd.read_csv(os.path.join(csv_path, "events.csv"))
     edges_df  = pd.read_csv(os.path.join(csv_path, "edges.csv"))
-    return traces_df, events_df, edges_df
+    ops_df    = pd.read_csv(os.path.join(csv_path, "operations.csv"))
+    return traces_df, events_df, edges_df, ops_df
 
 def stratified_ids(traces_df, seed=42):
-    trace_ids = traces_df["TaskID"]
+    trace_ids = traces_df["TaskID"].astype(str)
     labels    = traces_df["IsAbnormal"].astype(int)
     train_ids, temp_ids, y_train, y_temp = train_test_split(
         trace_ids, labels, test_size=0.30, stratify=labels, random_state=seed
@@ -59,13 +60,13 @@ def stratified_ids(traces_df, seed=42):
 # Graph building
 # =========================
 def build_op_vocab(events_df):
-    unique_eids = sorted(events_df["EventId"].dropna().astype(str).unique())
-    eid_to_ix = {eid: i + 1 for i, eid in enumerate(unique_eids)}
-    eid_to_ix["<UNK>"] = 0
-    num_tokens = len(eid_to_ix)
-    return eid_to_ix, num_tokens
+    unique_ops = sorted(events_df["OpName"].dropna().astype(str).unique())
+    opname_to_ix = {op: i + 1 for i, op in enumerate(unique_ops)}
+    opname_to_ix["<UNK>"] = 0
+    num_ops = len(opname_to_ix)
+    return opname_to_ix, num_ops
 
-def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, eid_to_ix=None):
+def build_graph_data_for_trace_tracebench(events_df, edges_df, traces_df, task_id, opname_to_ix=None):
     # Filter rows for this trace
     ev = events_df[events_df["TaskID"] == task_id].copy()
     ed = edges_df[edges_df["TaskID"] == task_id].copy()
@@ -97,15 +98,20 @@ def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, eid_to_i
     num_nodes = len(ev)
     denom = max(1, num_nodes - 1)
 
-    tid_nums = ev["TID"].astype(int).to_numpy()   # 0 .. N-1
-    pos = tid_nums / denom                       # normalized position
+    tid_nums = ev["TID"].astype(int).to_numpy()   # expected 0..N-1
+    pos = tid_nums / denom                       # normalized position in trace
     dist_end = (denom - tid_nums) / denom        # normalized distance from end
 
     # --------------------------------------
     # 3) TIMESTAMP FEATURES (normalized)
     # --------------------------------------
-    ts = ev["Timestamp"].astype("int64")
-    tsn = (ts - ts.min()) / max(1, (ts.max() - ts.min()))
+    if "StartTime" in ev.columns:
+        ts = ev["StartTime"].astype("float64").to_numpy()
+    else:
+        # fallback: use TID as pseudo-time if StartTime is missing
+        ts = tid_nums.astype("float64")
+
+    tsn = (ts - ts.min()) / max(1e-9, (ts.max() - ts.min()))
 
     # --------------------------------------
     # CONCAT ALL NUMERIC FEATURES
@@ -119,12 +125,12 @@ def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, eid_to_i
     ].astype("float32")
 
     # --------------------------------------
-    # CATEGORICAL TOKEN: EventId
+    # CATEGORICAL TOKEN: OpName
     # --------------------------------------
-    token_idx = None
-    if eid_to_ix is not None:
-        token_idx = ev["EventId"].astype(str).map(
-            lambda s: eid_to_ix.get(s, 0)
+    op_ix = None
+    if opname_to_ix is not None and "OpName" in ev.columns:
+        op_ix = ev["OpName"].map(
+            lambda s: opname_to_ix.get(str(s), 0)
         ).to_numpy().astype("int64")
 
     # --------------------------------------
@@ -137,18 +143,19 @@ def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, eid_to_i
             src.append(idx[u])
             dst.append(idx[v])
 
+    edge_index = np.array([src, dst], dtype="int64")
+
     # --------------------------------------
     # FINAL GRAPH DICT
     # --------------------------------------
     data = {
         "x_num": x_num,
-        "edge_index": np.array([src, dst], dtype="int64"),
+        "edge_index": edge_index,
         "y": np.array([int(tr["IsAbnormal"])], dtype="int64"),
         "TraceId": task_id,
     }
-
-    if token_idx is not None:
-        data["op_idx"] = token_idx
+    if op_ix is not None:
+        data["op_idx"] = op_ix
 
     return data
 
@@ -163,7 +170,7 @@ def to_pyg_data(g):
     data.trace_id = g["TraceId"]
     return data
 
-def build_graphs(ids, split_name, events_df, edges_df, traces_df, eid_to_ix,
+def build_graphs(ids, split_name, events_df, edges_df, traces_df, opname_to_ix,
                  progress_every=50, cache_dir="../graph_cache"):
     # ---- try cache first ----
     cache_path = _graphs_cache_path(cache_dir, split_name, ids)
@@ -176,7 +183,7 @@ def build_graphs(ids, split_name, events_df, edges_df, traces_df, eid_to_ix,
     graphs, skipped = [], 0
     for i, tid in enumerate(ids, 1):
         try:
-            g = build_graph_data_for_trace(events_df, edges_df, traces_df, tid, eid_to_ix)
+            g = build_graph_data_for_trace(events_df, edges_df, traces_df, tid, opname_to_ix)
             g = to_pyg_data(g)
             if g is not None:
                 graphs.append(g)
@@ -200,7 +207,7 @@ def build_graphs(ids, split_name, events_df, edges_df, traces_df, eid_to_ix,
 # Model & training
 # =========================
 class GraphClassifier(nn.Module):
-    def __init__(self, num_ops, x_num_dim=5, emb_dim=16, hidden=64, num_classes=2):
+    def __init__(self, num_ops, x_num_dim=4, emb_dim=16, hidden=64, num_classes=2):
         super().__init__()
         self.op_emb = nn.Embedding(num_ops, emb_dim)
         in_dim = x_num_dim + emb_dim
@@ -291,12 +298,12 @@ def test_model(model, test_loader, device):
 # =========================
 
 if __name__ == "__main__":
-    CSV_PATH = "../master_tables/BGL/test"
+    CSV_PATH = "../master_tables/TB/test"
     SEED = 42
     BATCH_SIZE = 16
-    EPOCHS = 30
+    EPOCHS = 20
     
-    traces_df, events_df, edges_df = load_csvs(CSV_PATH)
+    traces_df, events_df, edges_df, ops_df = load_csvs(CSV_PATH)
 
     train_ids, val_ids, test_ids = stratified_ids(traces_df, seed=SEED)
 
@@ -307,11 +314,11 @@ if __name__ == "__main__":
     show_split_distribution(traces_df, "Val",   val_ids)
     show_split_distribution(traces_df, "Test",  test_ids)
 
-    eid_to_ix, num_ops = build_op_vocab(events_df)
+    opname_to_ix, num_ops = build_op_vocab(events_df)
 
-    train_graphs = build_graphs(train_ids, "train", events_df, edges_df, traces_df, eid_to_ix)
-    val_graphs   = build_graphs(val_ids,   "val",   events_df, edges_df, traces_df, eid_to_ix)
-    test_graphs  = build_graphs(test_ids,  "test",  events_df, edges_df, traces_df, eid_to_ix)
+    train_graphs = build_graphs(train_ids, "train", events_df, edges_df, traces_df, opname_to_ix)
+    val_graphs   = build_graphs(val_ids,   "val",   events_df, edges_df, traces_df, opname_to_ix)
+    test_graphs  = build_graphs(test_ids,  "test",  events_df, edges_df, traces_df, opname_to_ix)
 
     train_loader, val_loader, test_loader = make_loaders(train_graphs, val_graphs, test_graphs, BATCH_SIZE)
     print("Graphs  | train:", len(train_graphs), "val:", len(val_graphs), "test:", len(test_graphs))

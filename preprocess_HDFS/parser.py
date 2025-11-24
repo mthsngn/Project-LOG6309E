@@ -16,6 +16,11 @@ os.makedirs(PARSED_DIR, exist_ok=True)
 os.makedirs(STATE_ROOT_DIR, exist_ok=True)
 OPEN_KW = dict(encoding="utf-8", errors="replace")
 
+# --- Regex HDFS ---
+HDFS_LOG_FORMAT_RE = re.compile(
+    r"^(?P<Date>\d{6})\s+(?P<Time>\d{6})\s+(?P<PID>\d+)\s+(?P<Level>\w+)\s+(?P<Component>[^:]+):\s+(?P<Content>.*)$")
+HDFS_BLOCK_ID_RE = re.compile(r"(blk_-?\d+)")
+
 
 # --- Fonctions Utilitaires ---
 def find_file(base_dir, extension):
@@ -78,58 +83,51 @@ def setup_drain(dataset_name):
     config.drain_depth = 4
     persistence = FilePersistence(os.path.join(STATE_ROOT_DIR, f"{dataset_name}_drain_state.bin"))
 
-    masking_rules = [
-        MaskingInstruction(re.compile(r'core\.\d+'), '<*>'),
-        MaskingInstruction(re.compile(r'(?<=r)\d{1,2}'), '<*>'),
-        MaskingInstruction(re.compile(r'(?<=fpr)\d{1,2}'), '<*>'),
-        MaskingInstruction(re.compile(r'0x[0-9a-fA-F]+'), '<*>'),
+    config.masking_instructions = [
+        MaskingInstruction(re.compile(r'blk_-?\d+'), "<*>"),
+        MaskingInstruction(re.compile(r'(\d+\.){3}\d+:\d+'), "<*>")
     ]
-    config.masking_instructions = masking_rules        
     return TemplateMiner(persistence, config)
 
 
 # --- Fonctions de Parsing ---
-def parse_bgl_full(log_path, miner):
-    structured_data = []
-
-    # Récupérer les règles de masquage depuis le miner
+def parse_hdfs_advanced(log_path, miner):
+    parsed_lines = []
     masking_rules = miner.config.masking_instructions if hasattr(miner.config, 'masking_instructions') else None
 
     with open(log_path, 'r', **OPEN_KW) as f:
-        for line_id, line in tqdm(enumerate(f, 1), desc="🧠  Parsing BGL"):
-            parts = line.strip().split()
-            if len(parts) < 9:
+        for line_id, line_content in tqdm(enumerate(f, 1), desc="🧠  Parsing HDFS"):
+            match = HDFS_LOG_FORMAT_RE.match(line_content.strip())
+            if not match:
                 continue
 
-            log_entry = {
-                'Label': parts[0], 'Timestamp': parts[1], 'Date': parts[2], 'Node': parts[3],
-                'Time': parts[4], 'NodeRepeat': parts[5], 'Type': parts[6], 'Component': parts[7],
-                'Level': parts[8], 'Content': ' '.join(parts[9:])
-            }
+            log_data = match.groupdict()
+            block_ids = HDFS_BLOCK_ID_RE.findall(log_data['Content'])
+            if not block_ids:
+                continue
 
-            result = miner.add_log_message(log_entry['Content'])
+            result = miner.add_log_message(log_data['Content'])
 
-            # Extraction avec les règles de masquage
             params = extract_parameters_before_masking(
-                log_entry['Content'],
+                log_data['Content'],
                 result['template_mined'],
                 masking_rules
             )
 
-            log_entry.update({
-                'LineId': line_id, 'EventId': result['cluster_id'],
-                'EventTemplate': result['template_mined'],
-                'ParameterList': str(params)
+            log_data.update({
+                "LineId": line_id, "BlockId": block_ids[0],
+                "EventTemplate": result['template_mined'],
+                "EventId": result['cluster_id'],
+                "ParameterList": str(params)
             })
-            structured_data.append(log_entry)
-
-    return pd.DataFrame(structured_data)
+            parsed_lines.append(log_data)
+    return pd.DataFrame(parsed_lines)
 
 
 def parse_log_file(dataset_name, log_path):
     print(f"\n--- Étape 1: Parsing de {dataset_name} ---")
     miner = setup_drain(dataset_name)
-    df = parse_bgl_full(log_path, miner)
+    df = parse_hdfs_advanced(log_path, miner)
     out_path = os.path.join(PARSED_DIR, f"{dataset_name}_parsed.csv")
     df.to_csv(out_path, index=False)
     print(f"   -> ✅ Parsing terminé : {out_path}")
@@ -137,7 +135,7 @@ def parse_log_file(dataset_name, log_path):
 
 # --- Script Principal ---
 if __name__ == "__main__":
-    for dataset in ["BGL"]:
+    for dataset in ["HDFS"]:
         base_dir = os.path.join(DATA_DIR, dataset)
         log_file_path = find_file(base_dir, ".log")
         if not log_file_path:

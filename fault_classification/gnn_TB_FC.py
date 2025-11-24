@@ -82,23 +82,13 @@ def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_t
     tids = ev["TID"].astype(str).tolist()
     idx = {t: i for i, t in enumerate(tids)}
 
-    st  = ev["StartTime"].astype("int64")
-    et  = ev["EndTime"].astype("int64")
-    dur = (et - st).clip(lower=0)
-
-    stn = (st - st.min()) / max(1, (st.max() - st.min()))
-    dun = dur / max(1, dur.max())
-
     indeg = pd.Series(0, index=tids); outdeg = pd.Series(0, index=tids)
     for _, r in ed.iterrows():
         if r["FatherTID"] in idx: outdeg[r["FatherTID"]] += 1
         if r["ChildTID"]  in idx: indeg[r["ChildTID"]]  += 1
 
     indeg_d, outdeg_d = indeg.to_dict(), outdeg.to_dict()
-    x_num = np.c_[stn.to_numpy(),
-                  dun.to_numpy(),
-                  ev["TID"].map(indeg_d).fillna(0).to_numpy(),
-                  ev["TID"].map(outdeg_d).fillna(0).to_numpy()].astype("float32")
+    x_num = np.c_[ev["TID"].map(indeg_d).fillna(0).to_numpy(), ev["TID"].map(outdeg_d).fillna(0).to_numpy()].astype("float32")
 
     op_ix = None
     if opname_to_ix is not None and "OpName" in ev.columns:
@@ -177,7 +167,7 @@ def build_graphs(ids, split_name, events_df, edges_df, traces_df, opname_to_ix,
 # Model & training
 # =========================
 class GraphClassifier(nn.Module):
-    def __init__(self, num_ops, x_num_dim=4, emb_dim=16, hidden=64, num_classes=2):
+    def __init__(self, num_ops, x_num_dim=2, emb_dim=16, hidden=64, num_classes=2):
         super().__init__()
         self.op_emb = nn.Embedding(num_ops, emb_dim)
         in_dim = x_num_dim + emb_dim

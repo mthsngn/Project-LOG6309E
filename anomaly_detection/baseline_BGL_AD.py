@@ -60,10 +60,10 @@ X_val, X_test, y_val, y_test = train_test_split(
 print(f"Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
 # =========================
-# Vectorization (Bag-of-EventId)
+# Vectorization (Bag-of-EventId = MCV)
 # =========================
 print("\nFitting CountVectorizer on EventId sequences...")
-vec = CountVectorizer(token_pattern=r"\S+", min_df=5)
+vec = CountVectorizer(token_pattern=r"\S+")
 X_train_vec = vec.fit_transform(X_train)
 X_val_vec   = vec.transform(X_val)
 X_test_vec  = vec.transform(X_test)
