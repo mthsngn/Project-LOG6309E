@@ -101,7 +101,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print("========== Loading CSV ==========")
-    seq_df = pd.read_csv("../bert_sequences/HDFS_encoder_seq.csv")
+    seq_df = pd.read_csv("../bert_sequences/TB_encoder_seq.csv")
     print(f"Taille originale : {len(seq_df):,}")
 
     seq_df_clean = seq_df[(seq_df["FaultType"].notna())].copy()

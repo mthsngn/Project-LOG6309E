@@ -258,7 +258,7 @@ def test_model(model, test_loader, device):
 # =========================
 
 if __name__ == "__main__":
-    CSV_PATH = "../master_tables/HDFS/test"
+    CSV_PATH = "../master_tables/TB/test"
     SEED = 42; 
     BATCH_SIZE = 16; 
     EPOCHS = 20

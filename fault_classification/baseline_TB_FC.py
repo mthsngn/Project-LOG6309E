@@ -15,7 +15,7 @@ from sklearn.metrics import (
 # =========================
 # Config
 # =========================
-CSV_PATH = "../master_tables/HDFS/test"
+CSV_PATH = "../master_tables/TB/test"
 SEED = 42
 
 # =========================

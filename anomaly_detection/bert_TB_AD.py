@@ -99,7 +99,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print("========== Loading CSV sequences ==========")
-    seq_df = pd.read_csv("../bert_sequences/HDFS_encoder_seq.csv")
+    seq_df = pd.read_csv("../bert_sequences/TB_encoder_seq.csv")
     print(f"Loaded sequences: {len(seq_df):,}")
 
     df = seq_df[["EventText", "IsAbnormal"]].dropna().reset_index(drop=True)
