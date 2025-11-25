@@ -45,6 +45,8 @@ Thumbs.db
 datasets/
 graph_cache/
 master_tables/
+bert_cache/
+models/
 
 preprocess_BGL/drain_states
 preprocess_BGL/parsed_logs

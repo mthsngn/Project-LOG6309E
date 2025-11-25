@@ -239,44 +239,44 @@ if __name__ == "__main__":
     best_epoch = -1
     best_model_path = "../models/best_TB_multiclass_bert.pt"
 
-    # for epoch in range(1, EPOCHS + 1):
-    #     model.train()
-    #     total_loss = 0.0
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
 
-    #     train_pbar = tqdm(train_loader, desc=f"Epoch {epoch} [train]")
-    #     for batch in train_pbar:
-    #         input_ids = batch["input_ids"].to(device)        # (B, max_events, L)
-    #         attention_mask = batch["attention_mask"].to(device)
-    #         labels = batch["labels"].to(device)              # (B,)
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch} [train]")
+        for batch in train_pbar:
+            input_ids = batch["input_ids"].to(device)        # (B, max_events, L)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)              # (B,)
 
-    #         logits = model(input_ids, attention_mask)        # (B, num_classes)
-    #         loss = criterion(logits, labels)
+            logits = model(input_ids, attention_mask)        # (B, num_classes)
+            loss = criterion(logits, labels)
 
-    #         optimizer.zero_grad()
-    #         loss.backward()
-    #         optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    #         total_loss += loss.item()
-    #         avg_batch_loss = total_loss / (len(train_pbar))
-    #         train_pbar.set_postfix({"loss": f"{avg_batch_loss:.4f}"})
+            total_loss += loss.item()
+            avg_batch_loss = total_loss / (len(train_pbar))
+            train_pbar.set_postfix({"loss": f"{avg_batch_loss:.4f}"})
 
-    #     avg_loss = total_loss / len(train_loader)
-    #     val_acc, val_p, val_r, val_f1 = eval_loop(
-    #         model, val_loader, device, desc=f"Epoch {epoch} [val]"
-    #     )
+        avg_loss = total_loss / len(train_loader)
+        val_acc, val_p, val_r, val_f1 = eval_loop(
+            model, val_loader, device, desc=f"Epoch {epoch} [val]"
+        )
 
-    #     # Save best model based on validation macro-F1
-    #     if val_f1 > best_f1:
-    #         best_f1 = val_f1
-    #         best_epoch = epoch
-    #         torch.save(model.state_dict(), best_model_path)
-    #         print(f"--> New BEST model saved (epoch {epoch}, val_f1={val_f1:.3f})")
+        # Save best model based on validation macro-F1
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best_epoch = epoch
+            torch.save(model.state_dict(), best_model_path)
+            print(f"--> New BEST model saved (epoch {epoch}, val_f1={val_f1:.3f})")
 
-    #     print(
-    #         f"\nEpoch {epoch} DONE ─ "
-    #         f"train_loss={avg_loss:.4f} | "
-    #         f"val_acc={val_acc:.3f} pr={val_p:.3f} rc={val_r:.3f} f1={val_f1:.3f}\n"
-    #     )
+        print(
+            f"\nEpoch {epoch} DONE ─ "
+            f"train_loss={avg_loss:.4f} | "
+            f"val_acc={val_acc:.3f} pr={val_p:.3f} rc={val_r:.3f} f1={val_f1:.3f}\n"
+        )
 
     print(f"\nLoading best checkpoint from epoch {best_epoch} (val_f1={best_f1:.3f})...")
     model.load_state_dict(torch.load(best_model_path, map_location=device))

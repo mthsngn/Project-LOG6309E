@@ -32,7 +32,7 @@ traces_df["TaskID"] = traces_df["TaskID"].astype(str)
 events_df["TaskID"] = events_df["TaskID"].astype(str)
 
 # =========================
-# Keep only labeled traces (same as when NPZ was created)
+# Keep only labeled traces
 # =========================
 valid_traces = traces_df[traces_df["FaultType"].notna()].copy()
 valid_ids = valid_traces["TaskID"].astype(str).tolist()

@@ -12,6 +12,8 @@ from torch_geometric.nn import GCNConv, global_mean_pool
 import hashlib
 import json
 import copy
+from transformers import AutoTokenizer, AutoModel
+from tqdm.auto import tqdm
 
 
 # =========================
@@ -19,7 +21,6 @@ import copy
 # =========================
 def _graphs_cache_path(cache_dir, split_name, ids):
     os.makedirs(cache_dir, exist_ok=True)
-    # fingerprint depends on the exact ordered TaskID list
     s = json.dumps(list(map(str, ids)), separators=(",", ":"), ensure_ascii=False)
     fid = hashlib.md5(s.encode("utf-8")).hexdigest()[:16]
     return os.path.join(cache_dir, f"{split_name}_graphs_{fid}.pt")
@@ -29,12 +30,12 @@ def stats(graphs):
     es = [g.edge_index.size(1) for g in graphs]
     return np.mean(ns), np.mean(es)
 
-def show_split_distribution(traces_df, name, ids):
+def show_split_distribution_multiclass(traces_df, name, ids, label_col="FaultType", top_k=5):
     subset = traces_df[traces_df["TaskID"].astype(str).isin(ids)]
-    counts = subset["IsAbnormal"].value_counts().to_dict()
-    total = len(subset)
-    normal = counts.get(0, 0); abnormal = counts.get(1, 0)
-    print(f"{name:<5} : total={total:5d} | normal={normal:5d} ({normal/total:.2%}) | abnormal={abnormal:5d} ({abnormal/total:.2%})")
+    vc = subset[label_col].astype(str).value_counts()
+    total = int(vc.sum())
+    head = ", ".join([f"{k}:{int(v)}({v/total:.1%})" for k, v in vc.head(top_k).items()])
+    print(f"{name:<5} : total={total:5d} | classes={len(vc)} | top{top_k}: {head}")
 
 # =========================
 # Data loading & splitting
@@ -46,9 +47,9 @@ def load_csvs(csv_path):
     ops_df    = pd.read_csv(os.path.join(csv_path, "operations.csv"))
     return traces_df, events_df, edges_df, ops_df
 
-def stratified_ids(traces_df, seed=42):
+def stratified_ids(traces_df, seed=42, label_col="FaultType"):
     trace_ids = traces_df["TaskID"].astype(str)
-    labels    = traces_df["IsAbnormal"].astype(int)
+    labels    = traces_df[label_col].astype(str)
     train_ids, temp_ids, y_train, y_temp = train_test_split(
         trace_ids, labels, test_size=0.30, stratify=labels, random_state=seed
     )
@@ -60,6 +61,77 @@ def stratified_ids(traces_df, seed=42):
 # =========================
 # Graph building
 # =========================
+def add_bert_desc_embeddings(
+    events_df,
+    cache_path="../bert_cache/tb_desc_bert_multi.npz",
+    model_name="bert-base-uncased",
+    max_len=32,
+    batch_size=128,
+    device=None,
+):
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+    # Order must match cache!
+    events_df = events_df.reset_index(drop=True)
+
+    # ===============================
+    # 1) LOAD FROM CACHE
+    # ===============================
+    if os.path.exists(cache_path):
+        print(f"Loading BERT description embeddings from {cache_path}")
+        data = np.load(cache_path)
+        embs = data["embs"]              # shape (N_events, H)
+
+        assert embs.shape[0] == len(events_df), \
+            f"Cached embeddings ({embs.shape[0]}) != events_df rows ({len(events_df)})"
+
+        events_df["desc_emb"] = list(embs)
+        hidden_size = embs.shape[1]
+        print(f"Loaded desc_emb dim={hidden_size}")
+        return events_df, hidden_size
+
+    # ===============================
+    # 2) COMPUTE WITH BERT
+    # ===============================
+    print("Computing BERT description embeddings (no finetuning)…")
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    descs = events_df["Description"].fillna("").astype(str).tolist()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    bert = AutoModel.from_pretrained(model_name).to(device)
+    bert.eval()
+
+    all_embs = []
+    num_batches = (len(descs) + batch_size - 1) // batch_size
+
+    with torch.no_grad():
+        # tqdm progress bar
+        for i in tqdm(range(0, len(descs), batch_size), total=num_batches, desc="BERT embedding"):
+            batch = descs[i:i + batch_size]
+            enc = tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=max_len,
+                return_tensors="pt",
+            ).to(device)
+
+            out = bert(**enc)
+            cls = out.last_hidden_state[:, 0, :]   # (B, H)
+            all_embs.append(cls.cpu().numpy())
+
+    embs = np.vstack(all_embs)      # (N_events, H)
+    hidden_size = embs.shape[1]
+
+    print(f"Computed desc_emb dim={hidden_size}, saving to {cache_path}")
+    np.savez_compressed(cache_path, embs=embs)
+
+    events_df["desc_emb"] = list(embs)
+    return events_df, hidden_size
+
 def build_op_vocab(events_df):
     unique_ops = sorted(events_df["OpName"].dropna().astype(str).unique())
     opname_to_ix = {op: i + 1 for i, op in enumerate(unique_ops)}
@@ -67,98 +139,132 @@ def build_op_vocab(events_df):
     num_ops = len(opname_to_ix)
     return opname_to_ix, num_ops
 
-def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_to_ix=None):
-    # Filter rows for this trace
+def build_fault_vocab(traces_df, label_col="FaultType"):
+    labels = traces_df[label_col].astype(str).unique()
+    labels = sorted(labels)
+    fault_to_ix = {lab: i for i, lab in enumerate(labels)}
+    ix_to_fault = {i: lab for lab, i in fault_to_ix.items()}
+    num_classes = len(fault_to_ix)
+    return fault_to_ix, ix_to_fault, num_classes
+
+def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_to_ix=None, label_col="FaultType", fault_to_ix=None):
+    # Filter rows
     ev = events_df[events_df["TaskID"] == task_id].copy()
     ed = edges_df[edges_df["TaskID"] == task_id].copy()
     tr = traces_df[traces_df["TaskID"] == task_id].iloc[0]
 
-    # Map TID -> local index in [0..n-1]
+    # -----------------------------
+    # Map TID → local 0..N-1
+    # -----------------------------
     tids = ev["TID"].astype(str).tolist()
     idx = {t: i for i, t in enumerate(tids)}
 
-    # --------------------------------------
-    # 1) DEGREE-BASED FEATURES
-    # --------------------------------------
+    # -----------------------------
+    # 1) DEGREE FEATURES
+    # -----------------------------
     indeg = pd.Series(0, index=tids)
     outdeg = pd.Series(0, index=tids)
 
     for _, r in ed.iterrows():
-        father = str(r["FatherTID"])
-        child  = str(r["ChildTID"])
-        if father in idx:
-            outdeg[father] += 1
-        if child in idx:
-            indeg[child] += 1
+        f = str(r["FatherTID"])
+        c = str(r["ChildTID"])
+        if f in idx: outdeg[f] += 1
+        if c in idx: indeg[c] += 1
 
-    indeg_d, outdeg_d = indeg.to_dict(), outdeg.to_dict()
+    indeg_d = indeg.to_dict()
+    outdeg_d = outdeg.to_dict()
 
-    # --------------------------------------
-    # 2) POSITION FEATURES (pos, dist_end)
-    # --------------------------------------
+    # -----------------------------
+    # 2) POSITION FEATURES
+    # -----------------------------
     num_nodes = len(ev)
     denom = max(1, num_nodes - 1)
 
     tid_nums = np.arange(len(ev), dtype="int64")
-    pos = tid_nums / denom                       # normalized position in trace
-    dist_end = (denom - tid_nums) / denom        # normalized distance from end
 
-    # --------------------------------------
-    # 3) TIMESTAMP FEATURES (normalized)
-    # --------------------------------------
+    pos = tid_nums / denom
+    dist_end = (denom - tid_nums) / denom
+
+    # -----------------------------
+    # 3) TIMESTAMP FEATURE
+    # -----------------------------
     if "StartTime" in ev.columns:
         ts = ev["StartTime"].astype("float64").to_numpy()
     else:
-        # fallback: use TID as pseudo-time if StartTime is missing
+        # fallback pseudo timestamp
         ts = tid_nums.astype("float64")
 
     tsn = (ts - ts.min()) / max(1e-9, (ts.max() - ts.min()))
 
-    # --------------------------------------
-    # CONCAT ALL NUMERIC FEATURES
-    # --------------------------------------
+    # -----------------------------
+    # CONCAT NUMERIC FEATURES
+    # -----------------------------
     x_num = np.c_[
-        ev["TID"].astype(str).map(indeg_d).fillna(0).to_numpy(),   # in-degree
-        ev["TID"].astype(str).map(outdeg_d).fillna(0).to_numpy(),  # out-degree
-        pos.astype("float32"),                                     # normalized position
-        dist_end.astype("float32"),                                # normalized dist. to end
-        tsn.astype("float32"),                                     # normalized timestamp
+        ev["TID"].astype(str).map(indeg_d).fillna(0).to_numpy(),  # in-degree
+        ev["TID"].astype(str).map(outdeg_d).fillna(0).to_numpy(), # out-degree
+        pos.astype("float32"),                                    # position
+        dist_end.astype("float32"),                               # distance from end
+        tsn.astype("float32"),                                    # timestamp
     ].astype("float32")
 
-    # --------------------------------------
-    # CATEGORICAL TOKEN: OpName
-    # --------------------------------------
+     # -----------------------------
+    # BERT DESCRIPTION EMBEDDINGS
+    # -----------------------------
+    if "desc_emb" in ev.columns:
+        # ev["desc_emb"] is a Series of np.ndarrays with shape (H,)
+        desc_mat = np.stack(ev["desc_emb"].to_list()).astype("float32")  # (num_nodes, H)
+        # concat along feature dimension
+        x_num = np.concatenate([x_num, desc_mat], axis=1)                # (num_nodes, 5+H)
+
+    # -----------------------------
+    # CATEGORICAL: OpName → index
+    # -----------------------------
     op_ix = None
     if opname_to_ix is not None and "OpName" in ev.columns:
         op_ix = ev["OpName"].map(
             lambda s: opname_to_ix.get(str(s), 0)
         ).to_numpy().astype("int64")
 
-    # --------------------------------------
-    # EDGES
-    # --------------------------------------
+    # -----------------------------
+    # LABEL: FaultType → index
+    # -----------------------------
+    if fault_to_ix is None:
+        raise ValueError("fault_to_ix mapping required for FaultType classification.")
+
+    y_raw = str(tr[label_col]) if label_col in tr.index else "<UNK>"
+    if y_raw not in fault_to_ix:
+        raise ValueError(f"Unknown FaultType: {y_raw}")
+    y_id = fault_to_ix[y_raw]
+
+    # -----------------------------
+    # EDGE LIST
+    # -----------------------------
     src, dst = [], []
     for _, r in ed.iterrows():
-        u, v = str(r["FatherTID"]), str(r["ChildTID"])
+        u = str(r["FatherTID"])
+        v = str(r["ChildTID"])
         if u in idx and v in idx:
             src.append(idx[u])
             dst.append(idx[v])
 
     edge_index = np.array([src, dst], dtype="int64")
 
-    # --------------------------------------
-    # FINAL GRAPH DICT
-    # --------------------------------------
+    # -----------------------------
+    # FINAL GRAPH DATA STRUCTURE
+    # -----------------------------
     data = {
         "x_num": x_num,
         "edge_index": edge_index,
-        "y": np.array([int(tr["IsAbnormal"])], dtype="int64"),
+        "y": np.array([int(y_id)], dtype="int64"),
         "TraceId": task_id,
     }
+
     if op_ix is not None:
         data["op_idx"] = op_ix
 
     return data
+
+
 
 def to_pyg_data(g):
     x_num = torch.from_numpy(g["x_num"])
@@ -172,43 +278,45 @@ def to_pyg_data(g):
     return data
 
 def build_graphs(ids, split_name, events_df, edges_df, traces_df, opname_to_ix,
-                 progress_every=50, cache_dir="../graph_cache"):
-    # ---- try cache first ----
+                 fault_to_ix, label_col="FaultType", progress_every=50,
+                 cache_dir="graph_cache"):
+    # ----- try cache -----
     cache_path = _graphs_cache_path(cache_dir, split_name, ids)
     if os.path.exists(cache_path):
         print(f"\nLoading cached {split_name} graphs from {cache_path} ...")
         return torch.load(cache_path)
 
-    # ---- build from scratch ----
+    # ----- build from scratch -----
     print(f"\nBuilding {split_name} graphs ({len(ids)} traces)...")
     graphs, skipped = [], 0
     for i, tid in enumerate(ids, 1):
         try:
-            g = build_graph_data_for_trace(events_df, edges_df, traces_df, tid, opname_to_ix)
-            g = to_pyg_data(g)
-            if g is not None:
-                graphs.append(g)
-            else:
-                skipped += 1
+            g = build_graph_data_for_trace(
+                events_df, edges_df, traces_df, tid,
+                opname_to_ix=opname_to_ix,
+                label_col=label_col,
+                fault_to_ix=fault_to_ix
+            )
+            graphs.append(to_pyg_data(g))
         except Exception as e:
             skipped += 1
             print(f"Skipping {tid}: {e}")
-
         if i % progress_every == 0 or i == len(ids):
             print(f"Processed {i}/{len(ids)} | valid: {len(graphs)} | skipped: {skipped}")
 
     print(f"Done {split_name}: {len(graphs)} valid, {skipped} skipped")
 
-    # ---- save cache ----
+    # ----- save cache -----
     torch.save(graphs, cache_path)
     print(f"Saved {split_name} graphs to {cache_path}\n")
     return graphs
+
 
 # =========================
 # Model & training
 # =========================
 class GraphClassifier(nn.Module):
-    def __init__(self, num_ops, x_num_dim=5, emb_dim=16, hidden=64, num_classes=2):
+    def __init__(self, num_ops, x_num_dim=5, emb_dim=16, hidden=64, num_classes=13):
         super().__init__()
         self.op_emb = nn.Embedding(num_ops, emb_dim)
         in_dim = x_num_dim + emb_dim
@@ -249,7 +357,7 @@ def run_epoch(model, loader, device, opt, criterion, training=True):
             total += batch.num_graphs
     return loss_sum / total, correct / total
 
-def prf_metrics(model, loader, device):
+def prf_metrics(model, loader, device, average="macro"):
     model.eval()
     all_preds, all_labels = [], []
     with torch.no_grad():
@@ -261,7 +369,7 @@ def prf_metrics(model, loader, device):
             all_labels.append(batch.y.cpu().numpy())
     y_pred = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
-    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
+    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average=average, zero_division=0)
     acc = accuracy_score(y_true, y_pred)
     return acc, p, r, f1
 
@@ -271,9 +379,9 @@ def make_loaders(train_graphs, val_graphs, test_graphs, batch_size=16):
     test_loader  = DataLoader(test_graphs,  batch_size=batch_size)
     return train_loader, val_loader, test_loader
 
-def init_model(train_graphs, num_ops, device, lr=1e-3, wd=1e-4, class_weights=None):
+def init_model(train_graphs, num_ops, device, num_classes, lr=1e-3, wd=1e-4, class_weights=None):
     x_num_dim = train_graphs[0].x.size(1)
-    model = GraphClassifier(num_ops=num_ops, x_num_dim=x_num_dim).to(device)
+    model = GraphClassifier(num_ops=num_ops, x_num_dim=x_num_dim, num_classes=num_classes).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     return model, opt, criterion
@@ -308,39 +416,68 @@ def test_model(model, test_loader, device):
 
 if __name__ == "__main__":
     CSV_PATH = "../master_tables/TB/test"
-    SEED = 42
-    BATCH_SIZE = 16
-    EPOCHS = 30
-    
-    traces_df, events_df, edges_df, ops_df = load_csvs(CSV_PATH)
+    SEED = 42; 
+    BATCH_SIZE = 16; 
+    EPOCHS = 200
+    LABEL_COL = "FaultType"
 
-    train_ids, val_ids, test_ids = stratified_ids(traces_df, seed=SEED)
+    traces_df, events_df, edges_df, ops_df = load_csvs(CSV_PATH)
+    valid_traces = traces_df[
+        traces_df["FaultType"].notna()
+    ].copy()
+
+    valid_ids = valid_traces["TaskID"].astype(str).tolist()
+    traces_df = traces_df[traces_df["TaskID"].astype(str).isin(valid_ids)].reset_index(drop=True)
+    events_df = events_df[events_df["TaskID"].astype(str).isin(valid_ids)]
+    edges_df  = edges_df[edges_df["TaskID"].astype(str).isin(valid_ids)]
+
+    # =========================
+    # Add BERT description embeddings to events
+    # =========================
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # === BERT embeddings for Description
+    events_df, bert_dim = add_bert_desc_embeddings(
+        events_df,
+        cache_path="../bert_cache/tb_desc_bert_multi.npz",
+        model_name="bert-base-uncased",
+        max_len=32,
+        batch_size=128,
+    )
+
+    # Stratify by FaultType
+    train_ids, val_ids, test_ids = stratified_ids(traces_df, seed=SEED, label_col=LABEL_COL)
 
     print(f"Total traces: {len(traces_df['TaskID'].unique())}")
     print(f"Train: {len(train_ids)} | Val: {len(val_ids)} | Test: {len(test_ids)}")
-    print("\nClass distribution:")
-    show_split_distribution(traces_df, "Train", train_ids)
-    show_split_distribution(traces_df, "Val",   val_ids)
-    show_split_distribution(traces_df, "Test",  test_ids)
+    print("\nClass distribution (top classes):")
+    show_split_distribution_multiclass(traces_df, "Train", train_ids, label_col=LABEL_COL)
+    show_split_distribution_multiclass(traces_df, "Val",   val_ids,   label_col=LABEL_COL)
+    show_split_distribution_multiclass(traces_df, "Test",  test_ids,  label_col=LABEL_COL)
 
+    # Vocabularies
     opname_to_ix, num_ops = build_op_vocab(events_df)
+    fault_to_ix, ix_to_fault, num_classes = build_fault_vocab(traces_df, label_col=LABEL_COL)
 
-    train_graphs = build_graphs(train_ids, "train", events_df, edges_df, traces_df, opname_to_ix)
-    val_graphs   = build_graphs(val_ids,   "val",   events_df, edges_df, traces_df, opname_to_ix)
-    test_graphs  = build_graphs(test_ids,  "test",  events_df, edges_df, traces_df, opname_to_ix)
+    # Graphs
+    train_graphs = build_graphs(train_ids, "train", events_df, edges_df, traces_df,
+                                opname_to_ix, fault_to_ix, label_col=LABEL_COL)
+    val_graphs   = build_graphs(val_ids, "val", events_df, edges_df, traces_df,
+                                opname_to_ix, fault_to_ix, label_col=LABEL_COL)
+    test_graphs  = build_graphs(test_ids, "test", events_df, edges_df, traces_df,
+                                opname_to_ix, fault_to_ix, label_col=LABEL_COL)
 
     train_loader, val_loader, test_loader = make_loaders(train_graphs, val_graphs, test_graphs, BATCH_SIZE)
-    print("Graphs  | train:", len(train_graphs), "val:", len(val_graphs), "test:", len(test_graphs))
-    print("Batches | train:", len(train_loader), "val:", len(val_loader), "test:", len(test_loader))
-    mN, mE = stats(train_graphs)
-    print(f"Avg nodes/graph: {mN:.1f} | Avg edges/graph: {mE:.1f}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     y_train = np.array([g.y.item() for g in train_graphs])
     classes = np.unique(y_train)
-    weights = compute_class_weight("balanced", classes=classes, y=y_train)
+    weights = compute_class_weight(
+        class_weight="balanced", classes=classes, y=y_train
+    )
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
-    model, opt, criterion = init_model(train_graphs, num_ops, device, class_weights=class_weights)
+    model, opt, criterion = init_model(
+    train_graphs, num_ops, device, num_classes, class_weights=class_weights
+    )
 
     best_state, best_f1 = train_and_eval(
         model, opt, criterion, train_loader, val_loader, device, EPOCHS
@@ -350,6 +487,7 @@ if __name__ == "__main__":
 
     # Load best epoch
     model.load_state_dict(best_state)
-
+    
     print("========== Testing best epoch ==========")
     test_model(model, test_loader, device)
+

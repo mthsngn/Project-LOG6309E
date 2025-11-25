@@ -175,7 +175,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print("========== Loading CSV sequences ==========")
-    seq_df = pd.read_csv("TB_encoder_seq.csv")
+    seq_df = pd.read_csv("../bert_sequences/TB_encoder_seq.csv")
     print(f"Loaded sequences (tasks/sessions): {len(seq_df):,}")
 
     # Base sessions dataframe
@@ -234,7 +234,7 @@ if __name__ == "__main__":
 
     best_f1 = -1.0
     best_epoch = -1
-    best_model_path = "best_TB_bert.pt"
+    best_model_path = "../models/best_TB_bert.pt"
 
     for epoch in range(1, EPOCHS + 1):
         model.train()

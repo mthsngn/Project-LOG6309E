@@ -234,7 +234,7 @@ if __name__ == "__main__":
 
     best_f1 = -1.0
     best_epoch = -1
-    best_model_path = "best_BGL_bert.pt"
+    best_model_path = "../models/best_BGL_bert.pt"
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
