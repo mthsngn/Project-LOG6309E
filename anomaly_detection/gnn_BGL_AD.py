@@ -11,6 +11,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
 import hashlib
 import json
+import copy
 
 
 # =========================
@@ -271,16 +272,24 @@ def init_model(train_graphs, num_ops, device, lr=1e-3, wd=1e-4, class_weights=No
     return model, opt, criterion
 
 def train_and_eval(model, opt, criterion, train_loader, val_loader, device, epochs=20):
+    best_state = copy.deepcopy(model.state_dict())
+    best_f1 = -1.0
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc = run_epoch(model, train_loader, device, opt, criterion, training=True)
         va_loss, va_acc = run_epoch(model, val_loader,   device, opt, criterion, training=False)
         va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device)
+
         print(
             f"Epoch {epoch:02d} | "
             f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
             f"val loss {va_loss:.4f} acc {va_acc:.3f} | "
             f"VAL pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
         )
+
+        if va_f1 > best_f1:
+            best_f1 = va_f1
+            best_state = copy.deepcopy(model.state_dict())
+    return best_state, best_f1
 
 def test_model(model, test_loader, device):
     te_acc, te_p, te_r, te_f1 = prf_metrics(model, test_loader, device)
@@ -294,7 +303,7 @@ if __name__ == "__main__":
     CSV_PATH = "../master_tables/BGL/test"
     SEED = 42
     BATCH_SIZE = 16
-    EPOCHS = 30
+    EPOCHS = 25
     
     traces_df, events_df, edges_df = load_csvs(CSV_PATH)
 
@@ -326,5 +335,11 @@ if __name__ == "__main__":
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
     model, opt, criterion = init_model(train_graphs, num_ops, device, class_weights=class_weights)
 
-    train_and_eval(model, opt, criterion, train_loader, val_loader, device, EPOCHS)
+    best_state, best_f1 = train_and_eval(
+        model, opt, criterion, train_loader, val_loader, device, EPOCHS
+    )
+    print(f"Best validation F1 = {best_f1:.4f}")
+    # Load best epoch
+    model.load_state_dict(best_state)
+    print("========== Testing best epoch ==========")
     test_model(model, test_loader, device)

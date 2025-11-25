@@ -11,35 +11,85 @@ from tqdm.auto import tqdm
 
 
 # =========================
-# Dataset
+# Utils
 # =========================
-class TextDataset(Dataset):
-    def __init__(self, df, tokenizer, max_len=256):
+
+def split_events(text: str):
+    """
+    Split the EventText of a session into individual event strings.
+    """
+    events = [e.strip() for e in text.split("[SEP]") if e.strip()]
+    if not events:
+        # fallback: if for some reason there is no separator
+        events = [text.strip()] if text.strip() else [""]
+    return events
+
+
+# =========================
+# Dataset (session-level, list of events)
+# =========================
+class SessionDataset(Dataset):
+    """
+    Each item is ONE session / TaskID.
+
+    Columns expected in df:
+        - TaskID
+        - EventText: concatenated events for that task
+        - IsAbnormal: 0/1 label
+
+    We:
+        - split EventText into events,
+        - optionally cap to MAX_EVENTS (keep last ones),
+        - tokenize all events (list of strings),
+        - return input_ids, attention_mask with shape (max_events, seq_len).
+    """
+
+    def __init__(self, df, tokenizer, max_len=128, max_events=64):
         self.df = df.reset_index(drop=True)
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.max_events = max_events
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+
+        event_text = str(row["EventText"])
+        label = int(row["IsAbnormal"])
+        task_id = int(row["TaskID"])
+
+        # 1) Split session into individual events
+        events = split_events(event_text)
+
+        # 2) Truncate / keep last max_events
+        if len(events) > self.max_events:
+            events = events[-self.max_events:]
+
+        # 3) Pad with empty strings if too short
+        if len(events) < self.max_events:
+            events = events + [""] * (self.max_events - len(events))
+
+        # 4) Tokenize list of events
         enc = self.tokenizer(
-            row["EventText"],
+            events,
             truncation=True,
             padding="max_length",
             max_length=self.max_len,
-            return_tensors="pt",
+            return_tensors="pt",   # shapes: (max_events, seq_len)
         )
-        item = {k: v.squeeze(0) for k, v in enc.items()}
-        item["labels"] = torch.tensor(row["IsAbnormal"], dtype=torch.float)
+
+        item = {k: v for k, v in enc.items()}
+        item["labels"] = torch.tensor(label, dtype=torch.float)
+        item["task_id"] = torch.tensor(task_id, dtype=torch.long)
         return item
 
 
 # =========================
-# Model
+# Model: BERT → event CLS → mean over events → MLP
 # =========================
-class BertBinaryClassifier(nn.Module):
+class BertSessionClassifier(nn.Module):
     def __init__(self, model_name, dropout=0.1):
         super().__init__()
         print("Loading BERT backbone…")
@@ -54,22 +104,45 @@ class BertBinaryClassifier(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask):
+        """
+        input_ids:      (batch, max_events, seq_len)
+        attention_mask: (batch, max_events, seq_len)
+        """
+        b, n, L = input_ids.shape
+
+        # Flatten events across batch: (b*n, L)
+        input_ids = input_ids.view(b * n, L)
+        attention_mask = attention_mask.view(b * n, L)
+
         out = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls = out.last_hidden_state[:, 0, :]
-        logits = self.mlp(cls).squeeze(-1)
+        cls = out.last_hidden_state[:, 0, :]   # (b*n, hidden)
+
+        # Reshape back to (batch, max_events, hidden)
+        hidden = cls.view(b, n, -1)
+
+        # Mean pooling over events -> session embedding
+        session_emb = hidden.mean(dim=1)       # (batch, hidden)
+
+        logits = self.mlp(session_emb).squeeze(-1)  # (batch,)
         return logits
 
 
 # =========================
-# Eval loop
+# Eval loop (session-level directly)
 # =========================
 def eval_loop(model, loader, device, desc="Eval"):
+    """
+    Evaluate at TASK (session) level.
+
+    Each batch item is already a full session, so we
+    just compute metrics over the session predictions.
+    """
     model.eval()
     all_preds, all_labels = [], []
 
     with torch.no_grad():
         for batch in tqdm(loader, desc=desc, leave=False):
-            input_ids = batch["input_ids"].to(device)
+            input_ids = batch["input_ids"].to(device)          # (B, max_events, L)
             attention_mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
 
@@ -96,47 +169,60 @@ def eval_loop(model, loader, device, desc="Eval"):
 if __name__ == "__main__":
 
     model_name = "bert-base-uncased"
+    MAX_LEN = 128      # tokens per event
+    MAX_EVENTS = 64    # events per session (cap)
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print("========== Loading CSV sequences ==========")
     seq_df = pd.read_csv("../bert_sequences/HDFS_encoder_seq.csv")
-    print(f"Loaded sequences: {len(seq_df):,}")
+    print(f"Loaded sequences (tasks/sessions): {len(seq_df):,}")
 
-    df = seq_df[["EventText", "IsAbnormal"]].dropna().reset_index(drop=True)
-    df["IsAbnormal"] = df["IsAbnormal"].astype(int)
+    # Base sessions dataframe
+    base_df = seq_df[["TaskID", "EventText", "IsAbnormal"]].dropna().reset_index(drop=True)
+    base_df["IsAbnormal"] = base_df["IsAbnormal"].astype(int)
+    base_df["TaskID"] = base_df["TaskID"].astype(int)
 
-    train_df, temp_df = train_test_split(
-        df, test_size=0.30, stratify=df["IsAbnormal"], random_state=42
+    print("========== Splitting tasks (train/val/test) ==========")
+    train_sess_df, temp_sess_df = train_test_split(
+        base_df,
+        test_size=0.30,
+        stratify=base_df["IsAbnormal"],
+        random_state=42,
     )
-    val_df, test_df = train_test_split(
-        temp_df, test_size=0.50, stratify=temp_df["IsAbnormal"], random_state=42
+    val_sess_df, test_sess_df = train_test_split(
+        temp_sess_df,
+        test_size=0.50,
+        stratify=temp_sess_df["IsAbnormal"],
+        random_state=42,
     )
 
-    print(f"Train size: {len(train_df):,}")
-    print(f"Val   size: {len(val_df):,}")
-    print(f"Test  size: {len(test_df):,}")
+    print(f"Train tasks: {len(train_sess_df):,}")
+    print(f"Val   tasks: {len(val_sess_df):,}")
+    print(f"Test  tasks: {len(test_sess_df):,}")
 
-    print("\nLabel distribution:")
-    print("Train:", train_df["IsAbnormal"].value_counts().to_dict())
-    print("Val  :", val_df["IsAbnormal"].value_counts().to_dict())
-    print("Test :", test_df["IsAbnormal"].value_counts().to_dict())
+    print("\nTask label distribution:")
+    print("Train:", train_sess_df["IsAbnormal"].value_counts().to_dict())
+    print("Val  :", val_sess_df["IsAbnormal"].value_counts().to_dict())
+    print("Test :", test_sess_df["IsAbnormal"].value_counts().to_dict())
 
-    print("========== Building datasets ==========")
-    train_ds = TextDataset(train_df, tokenizer)
-    val_ds   = TextDataset(val_df, tokenizer)
-    test_ds  = TextDataset(test_df, tokenizer)
+    print("\n========== Building datasets (session-level) ==========")
+    train_ds = SessionDataset(train_sess_df, tokenizer, max_len=MAX_LEN, max_events=MAX_EVENTS)
+    val_ds   = SessionDataset(val_sess_df,   tokenizer, max_len=MAX_LEN, max_events=MAX_EVENTS)
+    test_ds  = SessionDataset(test_sess_df,  tokenizer, max_len=MAX_LEN, max_events=MAX_EVENTS)
 
-    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=32)
-    test_loader  = DataLoader(test_ds, batch_size=32)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True)   # smaller B because heavier
+    val_loader   = DataLoader(val_ds,   batch_size=8)
+    test_loader  = DataLoader(test_ds,  batch_size=8)
 
     print("========== Initializing model ==========")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    model = BertBinaryClassifier(model_name).to(device)
+    model = BertSessionClassifier(model_name).to(device)
 
-    num_pos = (train_df["IsAbnormal"] == 1).sum()
-    num_neg = (train_df["IsAbnormal"] == 0).sum()
+    # Class weights computed on sessions
+    num_pos = (train_sess_df["IsAbnormal"] == 1).sum()
+    num_neg = (train_sess_df["IsAbnormal"] == 0).sum()
     pos_weight = torch.tensor([num_neg / num_pos], device=device)
     print(f"Class weights -> pos_weight={float(pos_weight):.2f}")
 
@@ -144,7 +230,11 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
 
     print("========== Training ==========")
-    EPOCHS = 3
+    EPOCHS = 15
+
+    best_f1 = -1.0
+    best_epoch = -1
+    best_model_path = "best_HDFS_bert.pt"
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -167,7 +257,15 @@ if __name__ == "__main__":
             loop.set_postfix(loss=loss.item())
 
         avg_loss = total_loss / len(train_loader)
-        val_acc, val_p, val_r, val_f1 = eval_loop(model, val_loader, device, desc=f"Epoch {epoch} [val]")
+        val_acc, val_p, val_r, val_f1 = eval_loop(
+            model, val_loader, device, desc=f"Epoch {epoch} [val]"
+        )
+
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best_epoch = epoch
+            torch.save(model.state_dict(), best_model_path)
+            print(f"--> New best model saved (epoch {epoch}, val_f1={val_f1:.3f})")
 
         print(
             f"\nEpoch {epoch} DONE ─ "
@@ -175,6 +273,9 @@ if __name__ == "__main__":
             f"val_acc={val_acc:.3f} pr={val_p:.3f} rc={val_r:.3f} f1={val_f1:.3f}\n"
         )
 
+    print(f"\nLoading best model from epoch {best_epoch} (val_f1={best_f1:.3f})...")
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+
     print("========== Final Test ==========")
     te_acc, te_p, te_r, te_f1 = eval_loop(model, test_loader, device, desc="Test")
-    print(f"\nTEST → acc {te_acc:.3f}  pr {te_p:.3f}  rc {te_r:.3f}  f1 {te_f1:.3f}")
+    print(f"\nTEST (Task-level) → acc {te_acc:.3f}  pr {te_p:.3f}  rc {te_r:.3f}  f1 {te_f1:.3f}")

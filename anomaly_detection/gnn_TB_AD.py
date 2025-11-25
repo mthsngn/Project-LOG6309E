@@ -11,6 +11,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
 import hashlib
 import json
+import copy
 
 
 # =========================
@@ -66,7 +67,7 @@ def build_op_vocab(events_df):
     num_ops = len(opname_to_ix)
     return opname_to_ix, num_ops
 
-def build_graph_data_for_trace_tracebench(events_df, edges_df, traces_df, task_id, opname_to_ix=None):
+def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_to_ix=None):
     # Filter rows for this trace
     ev = events_df[events_df["TaskID"] == task_id].copy()
     ed = edges_df[edges_df["TaskID"] == task_id].copy()
@@ -207,7 +208,7 @@ def build_graphs(ids, split_name, events_df, edges_df, traces_df, opname_to_ix,
 # Model & training
 # =========================
 class GraphClassifier(nn.Module):
-    def __init__(self, num_ops, x_num_dim=4, emb_dim=16, hidden=64, num_classes=2):
+    def __init__(self, num_ops, x_num_dim=5, emb_dim=16, hidden=64, num_classes=2):
         super().__init__()
         self.op_emb = nn.Embedding(num_ops, emb_dim)
         in_dim = x_num_dim + emb_dim
@@ -278,16 +279,24 @@ def init_model(train_graphs, num_ops, device, lr=1e-3, wd=1e-4, class_weights=No
     return model, opt, criterion
 
 def train_and_eval(model, opt, criterion, train_loader, val_loader, device, epochs=20):
+    best_state = copy.deepcopy(model.state_dict())
+    best_f1 = -1.0
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc = run_epoch(model, train_loader, device, opt, criterion, training=True)
         va_loss, va_acc = run_epoch(model, val_loader,   device, opt, criterion, training=False)
         va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device)
+
         print(
             f"Epoch {epoch:02d} | "
             f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
             f"val loss {va_loss:.4f} acc {va_acc:.3f} | "
             f"VAL pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
         )
+
+        if va_f1 > best_f1:
+            best_f1 = va_f1
+            best_state = copy.deepcopy(model.state_dict())
+    return best_state, best_f1
 
 def test_model(model, test_loader, device):
     te_acc, te_p, te_r, te_f1 = prf_metrics(model, test_loader, device)
@@ -301,7 +310,7 @@ if __name__ == "__main__":
     CSV_PATH = "../master_tables/TB/test"
     SEED = 42
     BATCH_SIZE = 16
-    EPOCHS = 20
+    EPOCHS = 30
     
     traces_df, events_df, edges_df, ops_df = load_csvs(CSV_PATH)
 
@@ -333,5 +342,14 @@ if __name__ == "__main__":
     class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
     model, opt, criterion = init_model(train_graphs, num_ops, device, class_weights=class_weights)
 
-    train_and_eval(model, opt, criterion, train_loader, val_loader, device, EPOCHS)
+    best_state, best_f1 = train_and_eval(
+        model, opt, criterion, train_loader, val_loader, device, EPOCHS
+    )
+
+    print(f"Best validation F1 = {best_f1:.4f}")
+
+    # Load best epoch
+    model.load_state_dict(best_state)
+
+    print("========== Testing best epoch ==========")
     test_model(model, test_loader, device)

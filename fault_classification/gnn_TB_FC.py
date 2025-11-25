@@ -11,6 +11,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
 import hashlib
 import json
+import copy
 
 
 # =========================
@@ -66,55 +67,121 @@ def build_op_vocab(events_df):
     return opname_to_ix, num_ops
 
 def build_fault_vocab(traces_df, label_col="FaultType"):
-    labels = traces_df[label_col].astype(str).fillna("<UNK>").unique()
+    labels = traces_df[label_col].astype(str).unique()
     labels = sorted(labels)
     fault_to_ix = {lab: i for i, lab in enumerate(labels)}
     ix_to_fault = {i: lab for lab, i in fault_to_ix.items()}
     num_classes = len(fault_to_ix)
     return fault_to_ix, ix_to_fault, num_classes
 
-def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_to_ix=None,
-                               label_col="FaultType", fault_to_ix=None):
+def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_to_ix=None, label_col="FaultType", fault_to_ix=None):
+    # Filter rows
     ev = events_df[events_df["TaskID"] == task_id].copy()
     ed = edges_df[edges_df["TaskID"] == task_id].copy()
     tr = traces_df[traces_df["TaskID"] == task_id].iloc[0]
 
+    # -----------------------------
+    # Map TID → local 0..N-1
+    # -----------------------------
     tids = ev["TID"].astype(str).tolist()
     idx = {t: i for i, t in enumerate(tids)}
 
-    indeg = pd.Series(0, index=tids); outdeg = pd.Series(0, index=tids)
+    # -----------------------------
+    # 1) DEGREE FEATURES
+    # -----------------------------
+    indeg = pd.Series(0, index=tids)
+    outdeg = pd.Series(0, index=tids)
+
     for _, r in ed.iterrows():
-        if r["FatherTID"] in idx: outdeg[r["FatherTID"]] += 1
-        if r["ChildTID"]  in idx: indeg[r["ChildTID"]]  += 1
+        f = str(r["FatherTID"])
+        c = str(r["ChildTID"])
+        if f in idx: outdeg[f] += 1
+        if c in idx: indeg[c] += 1
 
-    indeg_d, outdeg_d = indeg.to_dict(), outdeg.to_dict()
-    x_num = np.c_[ev["TID"].map(indeg_d).fillna(0).to_numpy(), ev["TID"].map(outdeg_d).fillna(0).to_numpy()].astype("float32")
+    indeg_d = indeg.to_dict()
+    outdeg_d = outdeg.to_dict()
 
+    # -----------------------------
+    # 2) POSITION FEATURES
+    # -----------------------------
+    num_nodes = len(ev)
+    denom = max(1, num_nodes - 1)
+
+    tid_nums = ev["TID"].astype(int).to_numpy()   # 0..N-1
+
+    pos = tid_nums / denom
+    dist_end = (denom - tid_nums) / denom
+
+    # -----------------------------
+    # 3) TIMESTAMP FEATURE
+    # -----------------------------
+    if "StartTime" in ev.columns:
+        ts = ev["StartTime"].astype("float64").to_numpy()
+    else:
+        # fallback pseudo timestamp
+        ts = tid_nums.astype("float64")
+
+    tsn = (ts - ts.min()) / max(1e-9, (ts.max() - ts.min()))
+
+    # -----------------------------
+    # CONCAT NUMERIC FEATURES
+    # -----------------------------
+    x_num = np.c_[
+        ev["TID"].astype(str).map(indeg_d).fillna(0).to_numpy(),  # in-degree
+        ev["TID"].astype(str).map(outdeg_d).fillna(0).to_numpy(), # out-degree
+        pos.astype("float32"),                                    # position
+        dist_end.astype("float32"),                               # distance from end
+        tsn.astype("float32"),                                    # timestamp
+    ].astype("float32")
+
+    # -----------------------------
+    # CATEGORICAL: OpName → index
+    # -----------------------------
     op_ix = None
     if opname_to_ix is not None and "OpName" in ev.columns:
-        op_ix = ev["OpName"].map(lambda s: opname_to_ix.get(str(s), 0)).to_numpy().astype("int64")
+        op_ix = ev["OpName"].map(
+            lambda s: opname_to_ix.get(str(s), 0)
+        ).to_numpy().astype("int64")
 
+    # -----------------------------
+    # LABEL: FaultType → index
+    # -----------------------------
     if fault_to_ix is None:
         raise ValueError("fault_to_ix mapping required for FaultType classification.")
-    y_id = fault_to_ix.get(str(tr[label_col]), None)
-    if y_id is None:
-        y_id = fault_to_ix.get("<UNK>", 0)
 
+    y_raw = str(tr[label_col]) if label_col in tr.index else "<UNK>"
+    if y_raw not in fault_to_ix:
+        raise ValueError(f"Unknown FaultType: {y_raw}")
+    y_id = fault_to_ix[y_raw]
+
+    # -----------------------------
+    # EDGE LIST
+    # -----------------------------
     src, dst = [], []
     for _, r in ed.iterrows():
-        u, v = r["FatherTID"], r["ChildTID"]
+        u = str(r["FatherTID"])
+        v = str(r["ChildTID"])
         if u in idx and v in idx:
-            src.append(idx[u]); dst.append(idx[v])
+            src.append(idx[u])
+            dst.append(idx[v])
 
+    edge_index = np.array([src, dst], dtype="int64")
+
+    # -----------------------------
+    # FINAL GRAPH DATA STRUCTURE
+    # -----------------------------
     data = {
         "x_num": x_num,
-        "edge_index": np.array([src, dst], dtype="int64"),
+        "edge_index": edge_index,
         "y": np.array([int(y_id)], dtype="int64"),
         "TraceId": task_id,
     }
+
     if op_ix is not None:
         data["op_idx"] = op_ix
+
     return data
+
 
 
 def to_pyg_data(g):
@@ -167,7 +234,7 @@ def build_graphs(ids, split_name, events_df, edges_df, traces_df, opname_to_ix,
 # Model & training
 # =========================
 class GraphClassifier(nn.Module):
-    def __init__(self, num_ops, x_num_dim=2, emb_dim=16, hidden=64, num_classes=2):
+    def __init__(self, num_ops, x_num_dim=5, emb_dim=16, hidden=64, num_classes=2):
         super().__init__()
         self.op_emb = nn.Embedding(num_ops, emb_dim)
         in_dim = x_num_dim + emb_dim
@@ -238,16 +305,24 @@ def init_model(train_graphs, num_ops, device, num_classes, lr=1e-3, wd=1e-4, cla
     return model, opt, criterion
 
 def train_and_eval(model, opt, criterion, train_loader, val_loader, device, epochs=20):
+    best_state = copy.deepcopy(model.state_dict())
+    best_f1 = -1.0
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc = run_epoch(model, train_loader, device, opt, criterion, training=True)
         va_loss, va_acc = run_epoch(model, val_loader,   device, opt, criterion, training=False)
-        va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device, average="macro")
+        va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device)
+
         print(
             f"Epoch {epoch:02d} | "
             f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
             f"val loss {va_loss:.4f} acc {va_acc:.3f} | "
-            f"VAL (macro) pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
+            f"VAL pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
         )
+
+        if va_f1 > best_f1:
+            best_f1 = va_f1
+            best_state = copy.deepcopy(model.state_dict())
+    return best_state, best_f1
 
 def test_model(model, test_loader, device):
     te_acc, te_p, te_r, te_f1 = prf_metrics(model, test_loader, device)
@@ -265,7 +340,14 @@ if __name__ == "__main__":
     LABEL_COL = "FaultType"
 
     traces_df, events_df, edges_df, ops_df = load_csvs(CSV_PATH)
-    traces_df = traces_df[traces_df["IsAbnormal"] == 1].reset_index(drop=True)
+    valid_traces = traces_df[
+        traces_df["FaultType"].notna()
+    ].copy()
+
+    valid_ids = valid_traces["TaskID"].astype(str).tolist()
+    traces_df = traces_df[traces_df["TaskID"].astype(str).isin(valid_ids)].reset_index(drop=True)
+    events_df = events_df[events_df["TaskID"].astype(str).isin(valid_ids)]
+    edges_df  = edges_df[edges_df["TaskID"].astype(str).isin(valid_ids)]
 
     # Stratify by FaultType
     train_ids, val_ids, test_ids = stratified_ids(traces_df, seed=SEED, label_col=LABEL_COL)
@@ -302,18 +384,15 @@ if __name__ == "__main__":
     train_graphs, num_ops, device, num_classes, class_weights=class_weights
     )
 
-    # Train / Eval
-    for epoch in range(1, EPOCHS + 1):
-        tr_loss, tr_acc = run_epoch(model, train_loader, device, opt, criterion, training=True)
-        va_loss, va_acc = run_epoch(model, val_loader,   device, opt, criterion, training=False)
-        va_acc_m, va_p, va_r, va_f1 = prf_metrics(model, val_loader, device, average="macro")
-        print(
-            f"Epoch {epoch:02d} | "
-            f"train loss {tr_loss:.4f} acc {tr_acc:.3f} | "
-            f"val loss {va_loss:.4f} acc {va_acc:.3f} | "
-            f"VAL (macro) pr {va_p:.3f} rc {va_r:.3f} f1 {va_f1:.3f}"
-        )
+    best_state, best_f1 = train_and_eval(
+        model, opt, criterion, train_loader, val_loader, device, EPOCHS
+    )
 
-    te_acc, te_p, te_r, te_f1 = prf_metrics(model, test_loader, device, average="macro")
-    print(f"\nTEST (macro) acc {te_acc:.3f} | pr {te_p:.3f} rc {te_r:.3f} f1 {te_f1:.3f}")
+    print(f"Best validation F1 = {best_f1:.4f}")
+
+    # Load best epoch
+    model.load_state_dict(best_state)
+
+    print("========== Testing best epoch ==========")
+    test_model(model, test_loader, device)
 

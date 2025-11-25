@@ -75,9 +75,8 @@ print(f"Feature dimension: {X_train_vec.shape[1]}")
 # =========================
 print("\nTraining logistic regression baseline...")
 clf = LogisticRegression(
-    max_iter=1000,
+    max_iter=3000,
     class_weight="balanced",
-    n_jobs=-1,
 )
 clf.fit(X_train_vec, y_train)
 

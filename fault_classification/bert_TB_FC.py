@@ -140,7 +140,6 @@ if __name__ == "__main__":
     print("Test:\n",  test_df["FaultType"].value_counts(), "\n")
 
     print("========== Building datasets ==========")
-
     train_ds = TextDataset(train_df, tokenizer)
     val_ds   = TextDataset(val_df, tokenizer)
     test_ds  = TextDataset(test_df, tokenizer)
@@ -170,6 +169,12 @@ if __name__ == "__main__":
 
     print("========== Training ==========")
     EPOCHS = 3
+
+    # Best-model tracking
+    best_f1 = -1.0
+    best_epoch = -1
+    best_model_path = "best_tb_multiclass_bert.pt"
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         total_loss = 0.0
@@ -188,11 +193,20 @@ if __name__ == "__main__":
             optimizer.step()
 
             total_loss += loss.item()
-            avg_batch_loss = total_loss / (len(train_pbar))  # approx, for display
+            avg_batch_loss = total_loss / (len(train_pbar))
             train_pbar.set_postfix({"loss": f"{avg_batch_loss:.4f}"})
 
         avg_loss = total_loss / len(train_loader)
-        val_acc, val_p, val_r, val_f1 = eval_loop(model, val_loader, device, desc=f"Epoch {epoch} [val]")
+        val_acc, val_p, val_r, val_f1 = eval_loop(
+            model, val_loader, device, desc=f"Epoch {epoch} [val]"
+        )
+
+        # Save best model based on validation F1 (macro-F1)
+        if val_f1 > best_f1:
+            best_f1 = val_f1
+            best_epoch = epoch
+            torch.save(model.state_dict(), best_model_path)
+            print(f"--> New BEST model saved (epoch {epoch}, val_f1={val_f1:.3f})")
 
         print(
             f"\nEpoch {epoch} DONE ─ "
@@ -200,6 +214,11 @@ if __name__ == "__main__":
             f"val_acc={val_acc:.3f} pr={val_p:.3f} rc={val_r:.3f} f1={val_f1:.3f}\n"
         )
 
+    # Reload best model before testing
+    print(f"\nLoading best checkpoint from epoch {best_epoch} (val_f1={best_f1:.3f})...")
+    model.load_state_dict(torch.load(best_model_path))
+
     print("========== Final Test ==========")
     te_acc, te_p, te_r, te_f1 = eval_loop(model, test_loader, device, desc="Test")
     print(f"\nTEST (macro) → acc {te_acc:.3f}  pr {te_p:.3f}  rc {te_r:.3f}  f1 {te_f1:.3f}")
+
