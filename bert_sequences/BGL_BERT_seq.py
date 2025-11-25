@@ -22,7 +22,7 @@ def build_encoder_sequences(events_df, traces_df, join_cols=("EventTemplate",), 
     # Group by TaskID and aggregate text
     seq = (
         df.groupby("TaskID")["EventText"]
-          .apply(lambda s: " ".join([t for t in s if t]))
+          .apply(lambda s: "[SEP]".join([t for t in s if t]))
           .reset_index()
     )
 

@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 
-CSV_PATH = "../master_tables/HDFS/test"
+CSV_PATH = "../master_tables/TB/test"
 
 def build_encoder_sequences(events_df, traces_df, join_cols=("OpName","Description"), order_cols=("StartTime","TID")):
     # Act on event_df
@@ -15,7 +15,7 @@ def build_encoder_sequences(events_df, traces_df, join_cols=("OpName","Descripti
     df["EventText"] = df.apply(get_events_text, axis=1)
 
     # Group by TaskID and aggregate text
-    seq = df.groupby("TaskID")["EventText"].apply(lambda s: " ".join([t for t in s if t])).reset_index()
+    seq = df.groupby("TaskID")["EventText"].apply(lambda s: "[SEP]".join([t for t in s if t])).reset_index()
 
     # Merge labels and info from traces_df
     labels = traces_df[["TaskID","IsAbnormal","FaultType","Category"]]
@@ -25,7 +25,6 @@ if __name__ == "__main__":
     traces_df = pd.read_csv(os.path.join(CSV_PATH, "traces.csv"))
     events_df = pd.read_csv(os.path.join(CSV_PATH, "events.csv"))
     edges_df = pd.read_csv(os.path.join(CSV_PATH, "edges.csv"))
-    ops_df = pd.read_csv(os.path.join(CSV_PATH, "operations.csv"))
 
     encoder_seq = build_encoder_sequences(events_df, traces_df)
-    encoder_seq.to_csv('HDFS_encoder_seq.csv', index=False)  
+    encoder_seq.to_csv('TB_encoder_seq.csv', index=False)  
