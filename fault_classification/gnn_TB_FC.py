@@ -107,7 +107,7 @@ def build_graph_data_for_trace(events_df, edges_df, traces_df, task_id, opname_t
     num_nodes = len(ev)
     denom = max(1, num_nodes - 1)
 
-    tid_nums = ev["TID"].astype(int).to_numpy()   # 0..N-1
+    tid_nums = np.arange(len(ev), dtype="int64")
 
     pos = tid_nums / denom
     dist_end = (denom - tid_nums) / denom
@@ -234,7 +234,7 @@ def build_graphs(ids, split_name, events_df, edges_df, traces_df, opname_to_ix,
 # Model & training
 # =========================
 class GraphClassifier(nn.Module):
-    def __init__(self, num_ops, x_num_dim=5, emb_dim=16, hidden=64, num_classes=2):
+    def __init__(self, num_ops, x_num_dim=5, emb_dim=16, hidden=64, num_classes=13):
         super().__init__()
         self.op_emb = nn.Embedding(num_ops, emb_dim)
         in_dim = x_num_dim + emb_dim
