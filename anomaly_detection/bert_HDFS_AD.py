@@ -170,13 +170,30 @@ if __name__ == "__main__":
 
     model_name = "bert-base-uncased"
     MAX_LEN = 128      # tokens per event
-    MAX_EVENTS = 64    # events per session (cap)
+    MAX_EVENTS = 16    # events per session (cap)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     print("========== Loading CSV sequences ==========")
     seq_df = pd.read_csv("../bert_sequences/HDFS_encoder_seq.csv")
     print(f"Loaded sequences (tasks/sessions): {len(seq_df):,}")
+
+    # Test
+    # N = 10000
+    # total = len(seq_df)
+    # seq_df_small = (
+    #     seq_df
+    #     .groupby("IsAbnormal", group_keys=False)
+    #     .apply(lambda g: g.sample(
+    #         n=max(1, int(round(N * len(g) / total))),  # proportional to class size
+    #         random_state=42
+    #     ))
+    #     .reset_index(drop=True)
+    # )
+
+    # seq_df = seq_df_small
+    # print(f"Using {len(seq_df)} sessions after stratified sampling")
+    # -------------------
 
     # Base sessions dataframe
     base_df = seq_df[["TaskID", "EventText", "IsAbnormal"]].dropna().reset_index(drop=True)
@@ -234,44 +251,44 @@ if __name__ == "__main__":
 
     best_f1 = -1.0
     best_epoch = -1
-    best_model_path = "best_HDFS_bert.pt"
+    best_model_path = "../models/best_HDFS_bert_few.pt"
 
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        total_loss = 0.0
+    # for epoch in range(1, EPOCHS + 1):
+    #     model.train()
+    #     total_loss = 0.0
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch} [train]")
-        for batch in loop:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+    #     loop = tqdm(train_loader, desc=f"Epoch {epoch} [train]")
+    #     for batch in loop:
+    #         input_ids = batch["input_ids"].to(device)
+    #         attention_mask = batch["attention_mask"].to(device)
+    #         labels = batch["labels"].to(device)
 
-            logits = model(input_ids, attention_mask)
-            loss = criterion(logits, labels)
+    #         logits = model(input_ids, attention_mask)
+    #         loss = criterion(logits, labels)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
 
-            total_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
+    #         total_loss += loss.item()
+    #         loop.set_postfix(loss=loss.item())
 
-        avg_loss = total_loss / len(train_loader)
-        val_acc, val_p, val_r, val_f1 = eval_loop(
-            model, val_loader, device, desc=f"Epoch {epoch} [val]"
-        )
+    #     avg_loss = total_loss / len(train_loader)
+    #     val_acc, val_p, val_r, val_f1 = eval_loop(
+    #         model, val_loader, device, desc=f"Epoch {epoch} [val]"
+    #     )
 
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            best_epoch = epoch
-            torch.save(model.state_dict(), best_model_path)
-            print(f"--> New best model saved (epoch {epoch}, val_f1={val_f1:.3f})")
+    #     if val_f1 > best_f1:
+    #         best_f1 = val_f1
+    #         best_epoch = epoch
+    #         torch.save(model.state_dict(), best_model_path)
+    #         print(f"--> New best model saved (epoch {epoch}, val_f1={val_f1:.3f})")
 
-        print(
-            f"\nEpoch {epoch} DONE ─ "
-            f"train_loss={avg_loss:.4f} | "
-            f"val_acc={val_acc:.3f} pr={val_p:.3f} rc={val_r:.3f} f1={val_f1:.3f}\n"
-        )
+    #     print(
+    #         f"\nEpoch {epoch} DONE ─ "
+    #         f"train_loss={avg_loss:.4f} | "
+    #         f"val_acc={val_acc:.3f} pr={val_p:.3f} rc={val_r:.3f} f1={val_f1:.3f}\n"
+    # )
 
     print(f"\nLoading best model from epoch {best_epoch} (val_f1={best_f1:.3f})...")
     model.load_state_dict(torch.load(best_model_path, map_location=device))
