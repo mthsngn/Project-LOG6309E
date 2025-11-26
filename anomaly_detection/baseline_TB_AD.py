@@ -40,6 +40,7 @@ def normalize_desc(desc):
 
 events_df["NormDesc"] = events_df["Description"].apply(normalize_desc)
 events_df["TextToken"] = events_df["OpName"].astype(str) + " : " + events_df["NormDesc"]
+# events_df["TextToken"] = events_df["OpName"].astype(str)
 
 # Group events by TaskID and make a sequence for each trace (TextToken)
 trace_sequences = (

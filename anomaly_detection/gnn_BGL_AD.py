@@ -178,6 +178,7 @@ def build_graphs(ids, split_name, events_df, edges_df, traces_df, eid_to_ix,
     for i, tid in enumerate(ids, 1):
         try:
             g = build_graph_data_for_trace(events_df, edges_df, traces_df, tid, eid_to_ix)
+            # g = build_graph_data_for_trace(events_df, edges_df, traces_df, tid, None)
             g = to_pyg_data(g)
             if g is not None:
                 graphs.append(g)

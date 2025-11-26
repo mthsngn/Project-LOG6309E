@@ -7,7 +7,7 @@
 ```text
 PROJECT-LOG6309E/
 │
-├── anomaly_detection/          # All anomaly detection models (baseline, BERT, GNN) for TraceBench, BGL and HDFS
+├── anomaly_detection/          # All anomaly detection models (baselines, BERT, GNN) for TraceBench, BGL and HDFS
 │
 ├── bert_sequences/             # Scripts + generated BERT sequence CSVs
 │   ├── *_BERT_seq.py           # Scripts that generate encoded sequences from logs
@@ -18,8 +18,10 @@ PROJECT-LOG6309E/
 │   ├── BGL/                    # BGL dataset (.log)
 │   └── HDFS/                   # HDFS dataset (.log + anomaly.csv)
 │
-├── fault_classification/       # Fault classification models (baseline, BERT, GNN) for Tracebench
+├── fault_classification/       # Fault classification models (baselines, BERT, GNN) for Tracebench
 │
+├── hybrid/                     # Hybrid models for Tracebench
+|
 ├── ipynb/                      # Jupyter notebooks for experiments and exploration
 │
 ├── master_tables/              # Processed master tables
