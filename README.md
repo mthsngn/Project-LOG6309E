@@ -20,7 +20,7 @@ PROJECT-LOG6309E/
 │
 ├── fault_classification/       # Fault classification models (baselines, BERT, GNN) for Tracebench
 │
-├── hybrid/                     # Hybrid models for Tracebench
+├── hybrid/                     # Hybrid models (GNN + BERT) for Tracebench
 |
 ├── ipynb/                      # Jupyter notebooks for experiments and exploration
 │
